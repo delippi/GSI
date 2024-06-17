@@ -57,13 +57,16 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
   use jfunc, only: jiter,last,jiterstart,miter,hofx_2m_sfcfile
 
   use guess_grids, only: nfldsig, hrdifsig,ges_lnprsl,&
-       geop_hgtl,ges_tsen,pbl_height
+       geop_hgtl,ges_tsen,pbl_height,geop_hgti !,geom_hgti
+  use guess_grids, only: ges_prsi
   use state_vectors, only: svars3d, levels, ns3d, svars2d
 
   use constants, only: zero, one, four,t0c,rd_over_cp,three,rd_over_cp_mass,ten
   use constants, only: tiny_r_kind,half,two
   use constants, only: huge_single,r1000,wgtlim,r10,fv
   use constants, only: one_quad
+  use constants, only: somigliana,grav_equator,grav_ratio,flattening,semi_major_axis 
+  use constants, only: eccentricity,deg2rad,grav
   use convinfo, only: nconvtype,cermin,cermax,cgross,cvar_b,cvar_pg,ictype,icsubtype
   use convinfo, only: ibeta,ikapa
   use converr_t, only: ptabl_t 
@@ -114,6 +117,7 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
                                                             ! array containing information ...
   real(r_kind),dimension(npres_print,nconvtype,5,3), intent(inout) :: bwork !  about o-g stats
   real(r_kind),dimension(100+7*nsig)               , intent(inout) :: awork !  for data counts and gross checks
+  real(r_kind) sin2,termg,termr,termrg,slat
 
 ! !DESCRIPTION:  For temperature observations, this routine
 ! \begin{enumerate}
@@ -279,16 +283,25 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
   real(r_kind),dimension(npredt):: pred
   real(r_kind),dimension(npredt):: predcoef
   real(r_kind) tgges,roges
-  real(r_kind),dimension(nsig):: tvtmp,qtmp,utmp,vtmp,hsges
+  real(r_kind),dimension(nsig):: ttmp,tvtmp,qtmp,utmp,vtmp,hsges
   real(r_kind) u10ges,v10ges,t2ges,q2ges,psges2,f10ges
   real(r_kind),dimension(34) :: ptablt
   real(r_single),allocatable,dimension(:,:)::rdiagbuf
   real(r_single),allocatable,dimension(:,:)::rdiagbufp
+  ! GSI profiles are stored with bottom up index; output the profiles
+  ! with top down index  
+  real(r_kind),dimension(nsig):: ttmp_reverse,tvtmp_reverse,qtmp_reverse,utmp_reverse,vtmp_reverse
+  real(r_kind),dimension(nsig):: hsges_reverse, zges_reverse,prsltmp2_reverse
+  real(r_kind),dimension(nsig):: zges_read_reverse, zges_geometric_reverse,zges_read,zges,zges_geometric
+  real(r_kind),dimension(nsig):: qsat, qsat_reverse
+  real(r_kind),dimension(nsig+1):: prsitmp_reverse
+  !<< JEDI 
 
 
   real(r_kind),dimension(nsig):: prsltmp2
+  real(r_kind),dimension(nsig+1):: prsitmp
 
-  integer(i_kind) i,j,nchar,nreal,k,ii,iip,jj,l,nn,ibin,idia,idia0,ix,ijb
+  integer(i_kind) i,j,nchar,nreal,k,kk,ii,iip,jj,l,nn,ibin,idia,idia0,ix,ijb
   integer(i_kind) mm1,jsig,iqt
   integer(i_kind) itype,msges
   integer(i_kind) ier,ilon,ilat,ipres,itob,id,itime,ikx,iqc,iptrb,icat,ipof,ivvlc,idx
@@ -595,6 +608,56 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
 
      if(.not.in_curbin) cycle
 
+!>>JEDI
+! GEOVALS for UFO eval
+     psges2  = psges          ! keep in cb
+     prsltmp2 = exp(prsltmp)
+     call tintrp2a1(ges_prsi,prsitmp,dlat,dlon,dtime,hrdifsig,&
+          nsig+1,mype,nfldsig)
+     call tintrp2a1(ges_tsen,ttmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(ges_q,qtmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(ges_u,utmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(ges_v,vtmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(geop_hgtl,hsges,dlat,dlon,dtime,hrdifsig,&       !orig
+          nsig,mype,nfldsig)
+     ! geometric height
+     call tintrp2a1(geop_hgtl,zges_read,dlat,dlon,dtime,hrdifsig, &
+          nsig+1,mype,nfldsig)
+     ! model virtual temperature (ges_tv) at obs location (lat/lon)
+     ! obs time, and model surface (lower model level)
+     !xxx call tintrp31(ges_tv,sfctges,dlat,dlon,log(psges),dtime, &
+     !xxx     hrdifsig,mype,nfldsig)
+
+!    Convert geopotential height at layer midpoints to geometric 
+!    height using equations (17, 20, 23) in MJ Mahoney's note 
+!    "A discussion of various measures of altitude" (2001).  
+!    Available on the web at
+!    http://mtp.jpl.nasa.gov/notes/altitude/altitude.html
+!
+!    termg  = equation 17
+!    termr  = equation 21
+!    termrg = first term in the denominator of equation 23
+!    zges  = equation 23
+!
+     slat = data(ilate,i)*deg2rad
+     sin2  = sin(slat)*sin(slat)
+     termg = grav_equator * &
+          ((one+somigliana*sin2)/sqrt(one-eccentricity*eccentricity*sin2))
+     termr = semi_major_axis /(one + flattening + grav_ratio -  &
+          two*flattening*sin2)
+     termrg = (termg/grav)*termr
+     do k=1,nsig
+        zges_geometric(k) = (termr*zges_read(k)) / (termrg-zges_read(k))  ! eq (23)
+     end do
+
+! END GEOVALS
+!<<JEDI
+
+
 !    Compute bias correction for aircraft data
      if (aircraft_t_bc_pof .or. aircraft_t_bc .or. aircraft_t_bc_ext) then 
         pof_idx = zero
@@ -675,6 +738,32 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
           mype,nfldsig)
      call tintrp2a1(ges_lnprsl,prsltmp,dlat,dlon,dtime,hrdifsig,&
           nsig,mype,nfldsig)
+     !prsltmp(2) = 4.61142871 !4.61138549307654
+     !prsltmp(1) = 4.61620397 !4.61616059644748
+
+! GEOVALS for UFO eval
+     psges2  = psges          ! keep in cb
+     prsltmp2 = exp(prsltmp)
+     call tintrp2a1(ges_prsi,prsitmp,dlat,dlon,dtime,hrdifsig,&
+          nsig+1,mype,nfldsig)
+     call tintrp2a1(ges_tsen,ttmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(ges_q,qtmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(ges_u,utmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(ges_v,vtmp,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+     call tintrp2a1(geop_hgtl,hsges,dlat,dlon,dtime,hrdifsig,&
+          nsig,mype,nfldsig)
+  
+!    Compute saturation_specific_humidity from air_temperature and air_pressure
+!    Eq. 2.19 from Roger's and Yau 2009
+     do k =1,nsig !LIPPI
+        qsat(k) = 0.62198*(6.112*exp(17.67*(ttmp(k)-t0c)/(ttmp(k)-t0c+243.5))*100.00)/(prsltmp2(k)*r1000)
+     end do
+
+! END GEOVALS
 
      drpx = zero
      if ( hofx_2m_sfcfile .and. landsfctype) then
@@ -1776,6 +1865,7 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
     call nc_diag_metadata_to_single("Prep_QC_Mark",data(iqc,i))
     call nc_diag_metadata_to_single("Setup_QC_Mark",data(iqt,i))
     call nc_diag_metadata_to_single("Prep_Use_Flag",data(iuse,i))
+    call nc_diag_metadata("Virtual_Temperature_Flag",nint(data(iqt,i)))
     if(muse(i)) then
        call nc_diag_metadata("Analysis_Use_Flag",    sngl(one)              )
     else
@@ -1844,6 +1934,54 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
        call nc_diag_data2d("Observation_Operator_Jacobian_endind", dhx_dx%end_ind)
        call nc_diag_data2d("Observation_Operator_Jacobian_val", real(dhx_dx%val,r_single))
     endif
+    ! GEOVALS
+    !>>emily
+    do k = 1, nsig
+       kk  = nsig-k+1
+       utmp_reverse(kk)     = utmp(k)
+       vtmp_reverse(kk)     = vtmp(k)
+       ttmp_reverse(kk)     = ttmp(k)
+       !tvtmp_reverse(kk)    = tges(k)   !emily
+       tvtmp_reverse(kk)    = tvtmp(k)   !ADC   
+       qtmp_reverse(kk)     = qtmp(k)
+       hsges_reverse(kk)    = hsges(k)
+       zges_read_reverse(kk)= zges_read(k)
+       zges_geometric_reverse(kk)= zges_geometric(k)
+       zges_reverse(kk)     = zges(k)
+       prsltmp2_reverse(kk) = prsltmp2(k)
+       qsat_reverse(kk)     = qsat(k)
+    enddo
+    do k = 1, nsig+1
+       kk  = (nsig+1)-k+1
+       prsitmp_reverse(kk)  = prsitmp(k)
+    enddo
+
+    call nc_diag_data2d("atmosphere_pressure_coordinate", sngl(prsltmp2_reverse*r1000))
+    call nc_diag_data2d("atmosphere_pressure_coordinate_interface", sngl(prsitmp_reverse*r1000))
+    call nc_diag_data2d("air_temperature", sngl(ttmp_reverse))
+    call nc_diag_data2d("virtual_temperature", sngl(tvtmp_reverse)) !emily
+    call nc_diag_data2d("specific_humidity", sngl(qtmp_reverse))
+    call nc_diag_data2d("eastward_wind", sngl(utmp_reverse))
+    call nc_diag_data2d("northward_wind", sngl(vtmp_reverse))
+    call nc_diag_data2d("geopotential_height", sngl(hsges_reverse) )       !orig 
+!    call nc_diag_data2d("geopotential_height", sngl(zges_read_reverse) ) !emily
+    call nc_diag_data2d("geometric_height", sngl(zges_geometric_reverse) )
+    !call nc_diag_data2d("surface_geometric_height", sngl(zges_geometric_reverse) )
+    call nc_diag_data2d("saturation_specific_humidity", sngl(qsat_reverse) )
+!    !emily
+    !<<emily
+
+    ! GEOVALS
+!    call nc_diag_data2d("atmosphere_pressure_coordinate", sngl(prsltmp2*r1000))
+!    call nc_diag_data2d("atmosphere_pressure_coordinate_interface",
+!    sngl(prsitmp*r1000))
+!    call nc_diag_data2d("air_temperature", sngl(ttmp))
+!    call nc_diag_data2d("specific_humidity", sngl(qtmp))
+!    call nc_diag_data2d("eastward_wind", sngl(utmp))
+!    call nc_diag_data2d("northward_wind", sngl(vtmp))
+!    call nc_diag_data2d("geopotential_height", sngl(hsges) )
+    call nc_diag_metadata("surface_air_pressure", sngl(psges2*r1000) )
+    ! END GEOVALS
 
   end subroutine contents_netcdf_diag_
 
@@ -1914,6 +2052,55 @@ subroutine setupt(obsLL,odiagLL,lunin,mype,bwork,awork,nele,nobs,is,conv_diagsav
        call nc_diag_data2d("Observation_Operator_Jacobian_val", real(dhx_dx%val,r_single))
     endif
 
+    ! GEOVALS
+    !>>emily
+    do k = 1, nsig
+       kk  = nsig-k+1
+       utmp_reverse(kk)     = utmp(k)
+       vtmp_reverse(kk)     = vtmp(k)
+       ttmp_reverse(kk)     = ttmp(k)
+       !tvtmp_reverse(kk)    = tges(k)   !emily
+       tvtmp_reverse(kk)    = tvtmp(k)   !ADC
+       qtmp_reverse(kk)     = qtmp(k)
+       hsges_reverse(kk)    = hsges(k)
+       zges_read_reverse(kk)= zges_read(k)
+       zges_geometric_reverse(kk)= zges_geometric(k)
+       zges_reverse(kk)     = zges(k)
+       prsltmp2_reverse(kk) = prsltmp2(k)
+       qsat_reverse(kk)     = qsat(k)
+    enddo
+    do k = 1, nsig+1
+       kk  = (nsig+1)-k+1
+       prsitmp_reverse(kk)  = prsitmp(k)
+    enddo
+
+
+    call nc_diag_data2d("atmosphere_pressure_coordinate", sngl(prsltmp2_reverse*r1000))
+    call nc_diag_data2d("atmosphere_pressure_coordinate_interface", sngl(prsitmp_reverse*r1000))
+    call nc_diag_data2d("air_temperature", sngl(ttmp_reverse))
+    call nc_diag_data2d("virtual_temperature", sngl(tvtmp_reverse)) !emily
+    call nc_diag_data2d("specific_humidity", sngl(qtmp_reverse))
+    call nc_diag_data2d("eastward_wind", sngl(utmp_reverse))
+    call nc_diag_data2d("northward_wind", sngl(vtmp_reverse))
+    call nc_diag_data2d("geopotential_height", sngl(hsges_reverse) )       !orig
+!    call nc_diag_data2d("geopotential_height", sngl(zges_read_reverse) ) !emily
+    !call nc_diag_data2d("geometric_height", sngl(zges_geometric_reverse) )
+    call nc_diag_data2d("surface_geometric_height", sngl(zges_geometric_reverse) )
+    call nc_diag_data2d("saturation_specific_humidity", sngl(qsat_reverse) )
+!    !emily
+    !<<emily
+
+    ! GEOVALS
+!    call nc_diag_data2d("atmosphere_pressure_coordinate", sngl(prsltmp2*r1000))
+!    call nc_diag_data2d("atmosphere_pressure_coordinate_interface",
+!    sngl(prsitmp*r1000))
+!    call nc_diag_data2d("air_temperature", sngl(ttmp))
+!    call nc_diag_data2d("specific_humidity", sngl(qtmp))
+!    call nc_diag_data2d("eastward_wind", sngl(utmp))
+!    call nc_diag_data2d("northward_wind", sngl(vtmp))
+    call nc_diag_data2d("surface_geopotential_height", sngl(hsges) )
+    call nc_diag_metadata("surface_air_pressure", sngl(psges2*r1000) )
+    ! END GEOVALS
   end subroutine contents_netcdf_diagp_
 
   subroutine final_vars_
